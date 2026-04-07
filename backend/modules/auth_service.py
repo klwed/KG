@@ -1,34 +1,22 @@
-import os
-import json
-from pathlib import Path
+import sqlite3
 from typing import Optional, List, Dict
 from datetime import datetime, timedelta
-import hashlib
 import uuid
 import jwt
 from passlib.context import CryptContext
 from ..core.config import get_settings
+from ..core.database import init_db
 
 settings = get_settings()
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-USERS_FILE = Path(__file__).parent.parent.parent / "data" / "users.json"
 
-
-def get_users_db() -> Dict:
-    USERS_FILE.parent.mkdir(exist_ok=True)
-    if not USERS_FILE.exists():
-        with open(USERS_FILE, "w", encoding="utf-8") as f:
-            json.dump({"users": [], "students": []}, f)
-
-    with open(USERS_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def save_users_db(data: Dict):
-    with open(USERS_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2, default=str)
+def get_db_connection():
+    init_db()
+    conn = sqlite3.connect(settings.sqlite_db_path)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def hash_password(password: str) -> str:
@@ -72,47 +60,53 @@ class AuthService:
         email: str = None,
         real_name: str = None,
     ) -> Dict:
-        db = get_users_db()
+        conn = get_db_connection()
+        cursor = conn.cursor()
 
-        if any(u["username"] == username for u in db["users"]):
+        cursor.execute("SELECT id FROM users WHERE username = ?", (username,))
+        if cursor.fetchone():
+            conn.close()
             return {"success": False, "error": "用户名已存在"}
 
         user_id = str(uuid.uuid4())
-        user = {
-            "id": user_id,
-            "username": username,
-            "password": hash_password(password),
-            "email": email,
-            "role": role,
-            "real_name": real_name or username,
-            "created_at": datetime.now().isoformat(),
-        }
+        password_hash = hash_password(password)
 
-        db["users"].append(user)
+        cursor.execute(
+            """
+            INSERT INTO users (id, username, password_hash, email, real_name, role, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                username,
+                password_hash,
+                email,
+                real_name or username,
+                role,
+                datetime.now().isoformat(),
+            ),
+        )
 
-        if role == "student":
-            db["students"].append(
-                {
-                    "user_id": user_id,
-                    "username": username,
-                    "real_name": real_name or username,
-                }
-            )
-
-        save_users_db(db)
+        conn.commit()
+        conn.close()
 
         return {"success": True, "user_id": user_id, "username": username}
 
     @staticmethod
     def authenticate_user(username: str, password: str) -> Optional[Dict]:
-        db = get_users_db()
+        conn = get_db_connection()
+        cursor = conn.cursor()
 
-        for user in db["users"]:
-            if user["username"] == username:
-                if verify_password(password, user["password"]):
-                    return user
-                return None
+        cursor.execute("SELECT * FROM users WHERE username = ?", (username,))
+        row = cursor.fetchone()
+        conn.close()
 
+        if not row:
+            return None
+
+        user = dict(row)
+        if verify_password(password, user["password_hash"]):
+            return user
         return None
 
     @staticmethod
@@ -135,35 +129,46 @@ class AuthService:
                 "email": user.get("email"),
                 "role": user["role"],
                 "real_name": user.get("real_name"),
-                "created_at": user["created_at"],
+                "created_at": user.get("created_at"),
             },
         }
 
     @staticmethod
     def get_user_by_id(user_id: str) -> Optional[Dict]:
-        db = get_users_db()
-        for user in db["users"]:
-            if user["id"] == user_id:
-                return user
-        return None
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+        row = cursor.fetchone()
+        conn.close()
+
+        return dict(row) if row else None
 
     @staticmethod
     def get_all_students() -> List[Dict]:
-        db = get_users_db()
-        return [u for u in db["users"] if u["role"] == "student"]
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT * FROM users WHERE role = ?", ("student",))
+        rows = cursor.fetchall()
+        conn.close()
+
+        return [dict(row) for row in rows]
 
     @staticmethod
     def get_teacher_students(teacher_id: str) -> List[Dict]:
-        db = get_users_db()
-        return [u for u in db["users"] if u["role"] == "student"]
+        return AuthService.get_all_students()
 
     @staticmethod
     def get_user_by_username(username: str) -> Optional[Dict]:
-        db = get_users_db()
-        for user in db["users"]:
-            if user["username"] == username:
-                return user
-        return None
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT * FROM users WHERE username = ?", (username,))
+        row = cursor.fetchone()
+        conn.close()
+
+        return dict(row) if row else None
 
 
 auth_service = AuthService()
