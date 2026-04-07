@@ -5,6 +5,14 @@ from ..core.config import get_settings
 
 settings = get_settings()
 
+try:
+    from ..services.rag_engine import rag_engine
+
+    RAG_AVAILABLE = True
+except ImportError:
+    RAG_AVAILABLE = False
+    rag_engine = None
+
 
 class KGQuerier:
     _instance = None
@@ -224,6 +232,64 @@ class KGQuerier:
 
         return {"nodes": list(nodes_dict.values()), "links": links_formatted}
 
+    def get_student_subgraph(self, student_name: str, depth: int = 2) -> Dict:
+        """获取学生的掌握情况子图"""
+        query = """
+        MATCH (student:学生 {name: $name})-[r:掌握]->(k:知识点)
+        OPTIONAL MATCH (k)-[:属于]->(c:课程)
+        OPTIONAL MATCH (k)-[:体现]->(ct:计算思维)
+        OPTIONAL MATCH (student)-[:掌握程度]->(level:掌握情况)
+        RETURN student.name as student_name,
+               k.name as knowledge,
+               r.score as score,
+               c.name as course,
+               collect(DISTINCT ct.name) as ct_dimensions,
+               level.name as mastery_level
+        """
+
+        results = self._run_query(query, {"name": student_name})
+
+        nodes_dict = {}
+        links_formatted = []
+
+        for r in results:
+            student = r.get("student_name")
+            knowledge = r.get("knowledge")
+            course = r.get("course")
+            ct_dims = r.get("ct_dimensions", [])
+            mastery = r.get("mastery_level")
+
+            if student and student not in nodes_dict:
+                nodes_dict[student] = {"id": student, "type": "学生"}
+
+            if knowledge and knowledge not in nodes_dict:
+                nodes_dict[knowledge] = {"id": knowledge, "type": "知识点"}
+
+            if course and course not in nodes_dict:
+                nodes_dict[course] = {"id": course, "type": "课程"}
+
+            for ct in ct_dims:
+                if ct and ct not in nodes_dict:
+                    nodes_dict[ct] = {"id": ct, "type": "计算思维"}
+
+            if student and knowledge:
+                links_formatted.append(
+                    {"source": student, "target": knowledge, "relation": "掌握"}
+                )
+
+            if course and knowledge:
+                links_formatted.append(
+                    {"source": course, "target": knowledge, "relation": "包含"}
+                )
+
+            for ct in ct_dims:
+                if knowledge and ct:
+                    links_formatted.append(
+                        {"source": knowledge, "target": ct, "relation": "体现"}
+                    )
+
+        return {"nodes": list(nodes_dict.values()), "links": links_formatted}
+
 
 class KGQA:
     def __init__(self):
@@ -276,7 +342,11 @@ class KGQA:
         session_id: str = "default",
         conversation_history: List[Dict] = None,
         username: str = None,
+        use_rag: bool = True,
     ) -> Dict:
+
+        if use_rag and RAG_AVAILABLE and rag_engine is not None:
+            return self.ask_with_rag(question, use_kg_only, username)
 
         context_triples = []
         context_entities = set()
@@ -364,6 +434,90 @@ class KGQA:
                 answer = self._llm_answer(
                     question, "", conversation_history or [], personal_context
                 )
+                return {
+                    "answer": answer,
+                    "source": "LLM",
+                    "related_triples": [],
+                    "subgraph": None,
+                    "personal_scores": personal_scores,
+                }
+
+    def ask_with_rag(
+        self,
+        question: str,
+        use_kg_only: bool = False,
+        username: str = None,
+    ) -> Dict:
+        if not RAG_AVAILABLE or rag_engine is None:
+            return self.ask(question, use_kg_only=use_kg_only, username=username)
+
+        personal_scores = None
+        if username and self.check_personal_question(question, username):
+            personal_scores = self.get_student_scores(username)
+
+        rag_result = rag_engine.retrieve(question)
+
+        if rag_result["has_results"]:
+            fused_results = rag_result["fused_results"]
+            context = rag_result["context"]
+            subgraph = None
+
+            keywords = []
+            for r in fused_results:
+                if r.get("source") == "knowledge_graph":
+                    head = r.get("head")
+                    if head:
+                        keywords.append(head)
+                else:
+                    content = r.get("content", "")
+                    if content:
+                        keywords.append(content[:20])
+
+            if keywords:
+                subgraph = self.querier.get_subgraph(keywords[0], depth=2)
+
+            personal_context = ""
+            if personal_scores:
+                personal_context = self.format_personal_context(
+                    personal_scores, question
+                )
+
+            if use_kg_only:
+                kg_triples = [
+                    r for r in fused_results if r.get("source") == "knowledge_graph"
+                ]
+                return {
+                    "answer": self._generate_kg_answer(kg_triples, question),
+                    "source": "knowledge_graph",
+                    "related_triples": fused_results,
+                    "subgraph": subgraph,
+                    "personal_scores": personal_scores,
+                }
+            else:
+                answer = self._llm_answer(question, context, [], personal_context)
+                return {
+                    "answer": answer,
+                    "source": f"RAG (向量:{rag_result['vector_count']} + 图谱:{rag_result['kg_count']})",
+                    "related_triples": fused_results,
+                    "subgraph": subgraph,
+                    "personal_scores": personal_scores,
+                }
+        else:
+            if use_kg_only:
+                return {
+                    "answer": "抱歉，知识图谱和向量库中都没有找到相关信息。",
+                    "source": "none",
+                    "related_triples": [],
+                    "subgraph": None,
+                    "personal_scores": personal_scores,
+                }
+            else:
+                personal_context = ""
+                if personal_scores:
+                    personal_context = self.format_personal_context(
+                        personal_scores, question
+                    )
+                answer = self._llm_answer(question, "", [], personal_context)
                 return {
                     "answer": answer,
                     "source": "LLM",

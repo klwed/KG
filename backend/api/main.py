@@ -21,6 +21,9 @@ from ..schemas.auth import TokenData
 from ..core.security import get_current_user, require_teacher
 from ..modules.student_processor import student_processor
 from .auth import router as auth_router
+from .graph import router as graph_router
+from .students import router as students_router
+from .qa import router as qa_router
 
 settings = get_settings()
 
@@ -35,6 +38,9 @@ app.add_middleware(
 )
 
 app.include_router(auth_router)
+app.include_router(graph_router)
+app.include_router(students_router)
+app.include_router(qa_router)
 
 DOCUMENTS_DIR = Path(__file__).parent.parent.parent / "documents"
 DOCUMENTS_DIR.mkdir(exist_ok=True)
@@ -74,6 +80,87 @@ async def process_document(file: UploadFile = File(...)):
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"处理失败: {str(e)}")
+
+
+@app.post("/api/document/vectorize")
+async def vectorize_document(file_path: str = Body(...)):
+    """将文档分块并添加到向量库"""
+    try:
+        from ..services.vector_store import vector_store
+
+        full_path = (
+            DOCUMENTS_DIR / file_path
+            if not Path(file_path).is_absolute()
+            else Path(file_path)
+        )
+        if not full_path.exists():
+            raise HTTPException(status_code=404, detail="文件不存在")
+
+        result = document_processor.process_document(str(full_path))
+        chunks = result["chunks"]
+
+        texts = [c["text"] for c in chunks]
+        metadata = [
+            {"source": full_path.name, "chunk_id": i, "text": c["text"][:200]}
+            for i, c in enumerate(chunks)
+        ]
+
+        vector_store.add(texts, metadata)
+        vector_store.save()
+
+        return {
+            "message": "文档已向量化",
+            "file": full_path.name,
+            "chunks": len(chunks),
+            "vector_count": vector_store.count(),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/document/vectorize/all")
+async def vectorize_all_documents():
+    """将所有文档向量化"""
+    try:
+        from ..services.vector_store import vector_store
+
+        vector_store.clear()
+
+        results = []
+        for f in DOCUMENTS_DIR.iterdir():
+            if f.is_file() and f.suffix.lower() in [".pdf", ".docx", ".doc", ".txt"]:
+                try:
+                    result = document_processor.process_document(str(f))
+                    chunks = result["chunks"]
+                    texts = [c["text"] for c in chunks]
+                    metadata = [
+                        {"source": f.name, "chunk_id": i, "text": c["text"][:200]}
+                        for i, c in enumerate(chunks)
+                    ]
+                    vector_store.add(texts, metadata)
+                    results.append({"file": f.name, "chunks": len(chunks)})
+                except Exception as e:
+                    results.append({"file": f.name, "error": str(e)})
+
+        vector_store.save()
+
+        return {"results": results, "total_vectors": vector_store.count()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/document/vectors")
+async def clear_vectors():
+    """清空向量库"""
+    try:
+        from ..services.vector_store import vector_store
+
+        vector_store.delete()
+        return {"message": "向量库已清空"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/document/list")

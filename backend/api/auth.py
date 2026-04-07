@@ -31,8 +31,8 @@ async def register(request: RegisterRequest):
         role = code_info["role"]
         invite_code_manager.use_code(request.invite_code, request.username)
     else:
-        db = auth_service.get_users_db()
-        if len(db["users"]) == 0:
+        all_users = auth_service.get_all_students()
+        if len(all_users) == 0:
             role = "teacher"
         else:
             raise HTTPException(
