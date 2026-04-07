@@ -1,9 +1,15 @@
+import os
+from pathlib import Path
 from typing import List, Optional
 import numpy as np
 from sentence_transformers import SentenceTransformer
 from ..core.config import get_settings
 
 settings = get_settings()
+
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+os.environ["HF_HOME"] = str(BASE_DIR / "models" / "huggingface")
+os.environ["HF_MODULES_CACHE"] = str(BASE_DIR / "models" / "huggingface" / "modules")
 
 
 class EmbeddingService:
