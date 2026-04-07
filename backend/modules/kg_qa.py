@@ -1,7 +1,7 @@
 from typing import List, Dict, Optional
 from neo4j import GraphDatabase
-from openai import OpenAI
 from ..core.config import get_settings
+from ..services.llm_service import llm_service
 
 settings = get_settings()
 
@@ -9,7 +9,6 @@ settings = get_settings()
 class KGQuerier:
     _instance = None
     _driver = None
-    _llm_client = None
 
     def __new__(cls):
         if cls._instance is None:
@@ -23,13 +22,6 @@ class KGQuerier:
                 auth=(settings.neo4j_username, settings.neo4j_password),
             )
         return self._driver
-
-    def _connect_llm(self):
-        if self._llm_client is None:
-            self._llm_client = OpenAI(
-                api_key=settings.deepseek_api_key, base_url=settings.deepseek_base_url
-            )
-        return self._llm_client
 
     def _run_query(self, query: str, params: Dict = None) -> List[Dict]:
         driver = self._connect_neo4j()
@@ -410,47 +402,12 @@ class KGQA:
         conversation_history: List[Dict] = None,
         personal_context: str = "",
     ) -> str:
-        client = self.querier._connect_llm()
-
-        system_prompt = """你是一个专业的知识图谱问答助手。如果知识图谱中有相关信息，优先基于知识图谱内容回答。
-        如果知识图谱中没有相关信息，请基于你的知识库回答。
-        回答要简洁、专业、清晰。如果用户追问，请结合之前的对话上下文回答。
-        如果用户提供个人信息（如个人掌握情况），请结合这些信息给出针对性的回答。"""
-
-        messages = [{"role": "system", "content": system_prompt}]
-
-        if conversation_history:
-            for hist in conversation_history[-5:]:
-                messages.append({"role": "user", "content": hist.get("question", "")})
-                messages.append(
-                    {"role": "assistant", "content": hist.get("answer", "")}
-                )
-
-        user_prompt_parts = []
-
-        if personal_context:
-            user_prompt_parts.append(f"【个人学习信息】\n{personal_context}")
-
-        if kg_context:
-            user_prompt_parts.append(f"【知识图谱信息】\n{kg_context}")
-
-        user_prompt_parts.append(f"【用户问题】\n{question}")
-
-        if personal_context:
-            user_prompt_parts.append(
-                "\n请结合上面的个人学习信息，针对用户的问题给出回答。"
-            )
-
-        messages.append({"role": "user", "content": "\n\n".join(user_prompt_parts)})
-
-        response = client.chat.completions.create(
-            model=settings.deepseek_model,
-            messages=messages,
-            temperature=0.3,
-            max_tokens=2048,
+        return llm_service.ask_question(
+            question=question,
+            kg_context=kg_context,
+            conversation_history=conversation_history,
+            personal_context=personal_context,
         )
-
-        return response.choices[0].message.content.strip()
 
 
 kg_qa = KGQA()
